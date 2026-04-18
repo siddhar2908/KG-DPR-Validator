@@ -3,3 +3,6 @@ __pycache__/
 venv/
 .env
 data/intermediate/
+llm_test.py
+test.py
+neo4j_test.py
