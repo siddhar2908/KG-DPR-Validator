@@ -1,0 +1,6 @@
+pdfplumber
+pdf2image
+pytesseract
+requests
+neo4j
+python-dotenv

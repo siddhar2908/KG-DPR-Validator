@@ -2,180 +2,129 @@ from collections import defaultdict
 from neo4j import GraphDatabase
 from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 from validation.rule_matcher import is_rule_applicable
-from validation.sanitizer import (
-    is_valid_rule_for_parameter,
-    is_valid_fact_for_parameter,
-    entity_match_score
-)
+from validation.sanitizer import is_valid_rule_for_parameter, is_valid_fact_for_parameter, entity_match_score
+
+FLAGGED_STATUSES = {"non-compliant", "unit-mismatch", "no-rule"}
 
 
-def evaluate(operator, rule_val, dpr_val):
+def _evaluate(operator: str, rule_val, dpr_val) -> str:
     try:
         rv = float(rule_val)
         dv = float(dpr_val)
     except Exception:
         return "non-compliant"
-
-    operator = str(operator).strip()
-
-    if operator == ">=":
-        return "compliant" if dv >= rv else "non-compliant"
-    if operator == "<=":
-        return "compliant" if dv <= rv else "non-compliant"
-    if operator == ">":
-        return "compliant" if dv > rv else "non-compliant"
-    if operator == "<":
-        return "compliant" if dv < rv else "non-compliant"
-    if operator == "==":
-        return "compliant" if dv == rv else "non-compliant"
-
-    return "non-compliant"
+    mapping = {">=": dv >= rv, "<=": dv <= rv, ">": dv > rv, "<": dv < rv, "==": dv == rv}
+    result = mapping.get(str(operator).strip())
+    if result is None:
+        return "non-compliant"
+    return "compliant" if result else "non-compliant"
 
 
-def fetch_rules_and_facts(session):
-    rules_query = """
-    MATCH (r:Rule)-[:ON_PARAMETER]->(p:ParameterConcept)
-    MATCH (r)-[:ON_ENTITY]->(e:EntityConcept)
-    RETURN
-        id(r) AS rule_id,
-        p.name AS parameter,
-        e.name AS entity,
-        r.operator AS operator,
-        r.value AS value,
-        r.unit AS unit,
-        r.page AS page,
-        r.context AS context,
-        r.condition_text AS condition_text,
-        r.confidence AS confidence,
-        r.mapping_confidence AS mapping_confidence
+def _fetch_rules(session, domain: str) -> list[dict]:
+    query = """
+    MATCH (r:Rule)-[:ON_PARAMETER]->(p:CanonicalParameter)
+    MATCH (r)-[:ON_ENTITY]->(e:CanonicalEntity)
+    MATCH (r)-[:DEFINED_IN]->(d:Document)-[:IN_DOMAIN]->(dom:Domain)
+    WHERE dom.name = $domain
+    RETURN p.name AS parameter, e.name AS entity, r.operator AS operator,
+           r.value AS value, r.unit AS unit, r.page AS page,
+           r.context_snippet AS context_snippet, r.condition_text AS condition_text,
+           r.source_document AS source_document, r.domain AS domain
     """
-
-    facts_query = """
-    MATCH (f:ObservedFact)-[:ON_PARAMETER]->(p:ParameterConcept)
-    MATCH (f)-[:ON_ENTITY]->(e:EntityConcept)
-    RETURN
-        id(f) AS fact_id,
-        p.name AS parameter,
-        e.name AS entity,
-        f.value AS value,
-        f.unit AS unit,
-        f.page AS page,
-        f.context AS context,
-        f.confidence AS confidence,
-        f.mapping_confidence AS mapping_confidence
-    """
-
-    rules = [dict(r) for r in session.run(rules_query)]
-    facts = [dict(f) for f in session.run(facts_query)]
-
-    return rules, facts
+    return [dict(r) for r in session.run(query, domain=domain)]
 
 
-def run_validation():
-    driver = GraphDatabase.driver(
-        NEO4J_URI,
-        auth=(NEO4J_USER, NEO4J_PASSWORD)
-    )
+def run_validation(dpr_facts: list[dict]) -> list[dict]:
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    domains = sorted({f.get("domain", "generic") for f in dpr_facts})
+    rules_by_domain = {}
+    with driver.session() as session:
+        for domain in domains:
+            rules_by_domain[domain] = _fetch_rules(session, domain)
+    driver.close()
+
+    clean_rules_by_domain = {}
+    for domain, rules in rules_by_domain.items():
+        clean_rules_by_domain[domain] = [r for r in rules if is_valid_rule_for_parameter(r["parameter"], r["unit"], r["value"])]
+
+    clean_facts = [f for f in dpr_facts if is_valid_fact_for_parameter(f["parameter"], f["unit"], f["value"])]
+
+    indexed_rules = {}
+    for domain, rules in clean_rules_by_domain.items():
+        bucket = defaultdict(list)
+        for r in rules:
+            bucket[r["parameter"]].append(r)
+        indexed_rules[domain] = bucket
 
     results = []
-
-    with driver.session() as session:
-        rules, facts = fetch_rules_and_facts(session)
-
-    # filter out obviously bad rules/facts
-    clean_rules = []
-    for r in rules:
-        if r["operator"] is None or r["value"] is None:
-            continue
-        if not is_valid_rule_for_parameter(r["parameter"], r["unit"], r["value"]):
-            continue
-        clean_rules.append(r)
-
-    clean_facts = []
-    for f in facts:
-        if f["value"] is None:
-            continue
-        if not is_valid_fact_for_parameter(f["parameter"], f["unit"], f["value"]):
-            continue
-        clean_facts.append(f)
-
-    # group rules by parameter
-    rules_by_param = defaultdict(list)
-    for r in clean_rules:
-        rules_by_param[r["parameter"]].append(r)
-
-    # validate each fact against best matching rule only
     for fact in clean_facts:
         parameter = fact["parameter"]
-        fact_entity = fact["entity"]
-        candidate_rules = rules_by_param.get(parameter, [])
-
-        if not candidate_rules:
+        entity = fact["entity"]
+        domain = fact.get("domain", "generic")
+        fact_unit = fact.get("unit", "")
+        candidates = indexed_rules.get(domain, {}).get(parameter, [])
+        if not candidates:
             results.append({
                 "parameter": parameter,
-                "entity": fact_entity,
+                "entity": entity,
+                "domain": domain,
+                "source_document": fact["source_document"],
+                "dpr_page": fact["page"],
+                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
                 "status": "no-rule",
-                "reason": "No matching rule found"
+                "flagged": True,
+                "reason": "No rule found for parameter in same domain",
             })
             continue
-
-        scored_candidates = []
-
-        for rule in candidate_rules:
-            score = entity_match_score(rule["entity"], fact_entity)
+        scored = []
+        for rule in candidates:
+            score = entity_match_score(rule["entity"], entity)
             if score == 0:
                 continue
-
-            if not is_rule_applicable(rule.get("condition_text", ""), fact.get("context", "")):
+            if not is_rule_applicable(rule.get("condition_text", ""), fact.get("context_snippet", "")):
                 continue
-
-            # prefer same unit too
-            unit_bonus = 1 if (rule.get("unit", "").strip().lower() == fact.get("unit", "").strip().lower()) else 0
-            total_score = score * 10 + unit_bonus
-
-            scored_candidates.append((total_score, rule))
-
-        if not scored_candidates:
+            unit_bonus = 1 if (rule.get("unit") or "").strip().lower() == (fact_unit or "").strip().lower() else 0
+            scored.append((score * 10 + unit_bonus, rule))
+        if not scored:
             results.append({
                 "parameter": parameter,
-                "entity": fact_entity,
+                "entity": entity,
+                "domain": domain,
+                "source_document": fact["source_document"],
+                "dpr_page": fact["page"],
+                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
                 "status": "no-rule",
-                "reason": "No applicable rule found after entity/context filtering"
+                "flagged": True,
+                "reason": "No applicable rule after entity/context filtering",
             })
             continue
-
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        best_rule = scored_candidates[0][1]
-
-        rule_unit = (best_rule.get("unit") or "").strip()
-        fact_unit = (fact.get("unit") or "").strip()
-
-        if rule_unit != fact_unit:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_rule = scored[0][1]
+        if (best_rule.get("unit") or "").strip() != (fact_unit or "").strip():
             results.append({
                 "parameter": parameter,
-                "entity": fact_entity,
+                "entity": entity,
+                "domain": domain,
+                "source_document": fact["source_document"],
+                "dpr_page": fact["page"],
+                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
                 "status": "unit-mismatch",
-                "rule": f'{best_rule["operator"]} {best_rule["value"]} {rule_unit}'.strip(),
-                "dpr_value": f'{fact["value"]} {fact_unit}'.strip(),
-                "reason": "Best matching rule found, but normalized units do not match"
+                "flagged": True,
+                "rule": f"{best_rule['operator']} {best_rule['value']} {best_rule['unit']}".strip(),
+                "rule_page": best_rule.get("page"),
             })
             continue
-
-        status = evaluate(best_rule["operator"], best_rule["value"], fact["value"])
-
+        status = _evaluate(best_rule["operator"], best_rule["value"], fact["value"])
         results.append({
             "parameter": parameter,
-            "entity": fact_entity,
-            "rule": f'{best_rule["operator"]} {best_rule["value"]} {rule_unit}'.strip(),
-            "dpr_value": f'{fact["value"]} {fact_unit}'.strip(),
-            "status": status,
-            "rule_page": best_rule["page"],
+            "entity": entity,
+            "domain": domain,
+            "source_document": fact["source_document"],
             "dpr_page": fact["page"],
-            "rule_context": best_rule["context"],
-            "dpr_context": fact["context"],
-            "rule_confidence": best_rule["confidence"],
-            "dpr_confidence": fact["confidence"]
+            "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
+            "status": status,
+            "flagged": status in FLAGGED_STATUSES,
+            "rule": f"{best_rule['operator']} {best_rule['value']} {best_rule['unit']}".strip(),
+            "rule_page": best_rule.get("page"),
         })
-
-    driver.close()
     return results

@@ -1,8 +1,38 @@
+# -------------------------
+# Python
+# -------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# -------------------------
+# Virtual environments
+# -------------------------
 venv/
+.env/
+
+# -------------------------
+# Environment variables
+# -------------------------
 .env
+
+# -------------------------
+# Intermediate pipeline outputs (IGNORE)
+# -------------------------
 data/intermediate/
-llm_test.py
-test.py
-neo4j_test.py
+data/output/
+
+# -------------------------
+# Allow input PDFs (KEEP)
+# -------------------------
+!data/input/
+!data/input/*.pdf
+
+# -------------------------
+# OS / IDE junk
+# -------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

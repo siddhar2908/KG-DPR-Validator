@@ -2,11 +2,18 @@ import json
 import re
 
 
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
 def safe_json_parse(response: str):
     if not response:
         return []
 
-    response = response.strip()
+    response = _strip_code_fences(response)
 
     try:
         parsed = json.loads(response)
@@ -14,6 +21,7 @@ def safe_json_parse(response: str):
             return parsed
         if isinstance(parsed, dict):
             return [parsed]
+        return []
     except Exception:
         pass
 
@@ -38,6 +46,6 @@ def safe_json_parse(response: str):
 
 def safe_single_json(response: str):
     data = safe_json_parse(response)
-    if isinstance(data, list) and data:
+    if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0]
     return {}

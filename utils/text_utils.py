@@ -16,7 +16,6 @@ def clean_text(text: str) -> str:
 
 def chunk_paragraphs(text: str, max_chars: int = 1800, overlap_paragraphs: int = 0):
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-
     if not paragraphs:
         return []
 
@@ -30,10 +29,8 @@ def chunk_paragraphs(text: str, max_chars: int = 1800, overlap_paragraphs: int =
         else:
             if current:
                 chunks.append("\n\n".join(current))
-
             overlap = current[-overlap_paragraphs:] if overlap_paragraphs > 0 else []
             current = overlap + [para]
-
             while len("\n\n".join(current)) > max_chars and len(current) > 1:
                 current.pop(0)
 

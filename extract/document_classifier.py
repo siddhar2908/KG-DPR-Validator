@@ -1,13 +1,15 @@
 import os
 from llm.ollama_client import call_llm
 from utils.json_utils import safe_single_json
+from config import CLASSIFIER_MODEL_NAME
 
 
 def classify_pages(pages, pdf_path: str):
-    sample_text = "\n\n".join([p["text"][:1000] for p in pages[:3] if p["text"]])[:2500]
+    sample_text = "\n\n".join([p["text"][:1200] for p in pages[:4] if p["text"]])[:3500]
+    filename = os.path.basename(pdf_path).lower()
 
     prompt = f"""
-Classify this document.
+Classify this technical PDF for a validation pipeline.
 
 Return ONLY valid JSON.
 
@@ -20,35 +22,55 @@ Schema:
 }}
 
 Allowed values:
-- document_kind: "rulebook", "dpr", "report", "unknown"
-- domain: "highway", "inland_waterway", "building", "irrigation", "generic", "unknown"
+- document_kind: "rulebook", "dpr", "unknown"
+- domain: "highway", "railway", "inland_waterway", "building", "irrigation", "generic", "unknown"
 
+Classification guidance:
+- "rulebook" = standards, codes, guidelines, manuals, specifications, rule documents
+- "dpr" = detailed project report, feasibility report, project-specific report
+- "unknown" = cannot confidently decide
+
+Filename: {filename}
 TEXT:
 {sample_text}
 """
 
-    response = call_llm(prompt)
+    response = call_llm(prompt, model_name=CLASSIFIER_MODEL_NAME)
     result = safe_single_json(response)
+    if not isinstance(result, dict):
+        result = {}
 
-    if not result:
-        filename = os.path.basename(pdf_path).lower()
+    doc_kind = str(result.get("document_kind", "")).strip().lower()
+    domain = str(result.get("domain", "")).strip().lower()
 
-        guessed_kind = "rulebook" if any(x in filename for x in ["is-", "iwai", "pianc", "irc"]) else "dpr"
-        guessed_domain = "inland_waterway" if any(x in filename for x in ["kosi", "waterway", "iwt", "pianc", "iwai"]) else "generic"
+    if doc_kind not in {"rulebook", "dpr", "unknown"}:
+        if any(x in filename for x in ["is-", "is ", "irc", "code", "standard", "guideline", "specification", "pianc", "iwai"]):
+            doc_kind = "rulebook"
+        elif "dpr" in filename:
+            doc_kind = "dpr"
+        else:
+            doc_kind = "unknown"
 
-        result = {
-            "document_kind": guessed_kind,
-            "domain": guessed_domain,
-            "subdomain": "",
-            "confidence": 0.2
-        }
+    if domain in {"", "unknown", "generic"}:
+        text_hint = sample_text.lower()
+        if any(x in filename for x in ["kosi", "waterway", "iwt", "pianc", "iwai", "river", "barrage", "fairway", "channel"]) or any(x in text_hint for x in ["inland waterway", "iwt", "fairway", "navigational", "barrage", "river", "channel depth", "design discharge"]):
+            domain = "inland_waterway"
+        elif any(x in filename for x in ["rail", "railway", "track", "station", "rds0", "platform"]) or any(x in text_hint for x in ["track gauge", "platform", "railway", "axle load"]):
+            domain = "railway"
+        elif any(x in filename for x in ["road", "highway", "irc", "bridge", "culvert", "expressway", "nh"]) or any(x in text_hint for x in ["carriageway", "shoulder width", "median", "design speed", "highway"]):
+            domain = "highway"
+        else:
+            domain = "generic"
 
-    result["source_document"] = os.path.basename(pdf_path).replace(".pdf", "").strip().lower()
-    result["file_path"] = pdf_path
-    return result
+    confidence = float(result.get("confidence", 0.0) or 0.0)
+    if confidence <= 0:
+        confidence = 0.3
 
-
-def classify_document(pdf_path: str):
-    from extract.pdf_reader import read_pdf_pages
-    pages = read_pdf_pages(pdf_path)
-    return classify_pages(pages, pdf_path)
+    return {
+        "document_kind": doc_kind,
+        "domain": domain,
+        "subdomain": str(result.get("subdomain", "")).strip(),
+        "confidence": confidence,
+        "source_document": os.path.basename(pdf_path).replace(".pdf", "").strip().lower(),
+        "file_path": pdf_path,
+    }
