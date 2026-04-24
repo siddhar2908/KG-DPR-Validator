@@ -4,144 +4,256 @@ from llm.ollama_client import call_llm
 from utils.json_utils import safe_json_parse
 from utils.page_filters import should_skip_page
 from utils.text_utils import chunk_paragraphs
-from utils.value_utils import normalize_numeric_value_and_unit
-from ontology.mapper import map_to_ontology
+from utils.value_utils import (
+    clean_sentence,
+    clean_text,
+    extract_range,
+    make_readable_fact_id,
+    normalize_numeric_value_and_unit,
+    safe_slug,
+    stable_id,
+)
+from ontology.mapper import normalize_parameter, normalize_entity, infer_domain_from_parameter
 from config import DEBUG_MAX_DPR_PAGES, EXTRACTION_MODEL_NAME
 
 
 def is_bad_dpr_candidate(item: dict) -> bool:
-    parameter = str(item.get("parameter", "")).strip().lower()
-    entity = str(item.get("entity", "")).strip().lower()
-    context = str(item.get("context_snippet", "")).strip().lower()
-    value = item.get("value")
-    unit = str(item.get("unit", "")).strip().lower()
-    if not parameter:
+    parameter = item.get("parameter", "")
+    text = item.get("fact_text", "").lower()
+    context = item.get("context_snippet", "").lower()
+
+    if not parameter or parameter == "unknown_parameter":
         return True
-    if parameter in {"number", "size", "value"} and entity in {"", "unknown"}:
+
+    if "table of contents" in context or "list of tables" in context or "list of figures" in context:
         return True
-    if value is not None and unit == "" and parameter in {"length", "width", "height", "depth"} and entity in {"", "unknown"}:
+
+    bad_terms = [
+        "cost",
+        "budget",
+        "crore",
+        "landuse",
+        "cash flow",
+        "tax",
+        "parking",
+        "humidity",
+        "rainfall",
+        "weather",
+        "fare",
+        "afc",
+        "maintenance schedule",
+        "coach dimensions",
+    ]
+
+    if any(t in parameter for t in bad_terms):
         return True
-    banned_terms = ["cost", "budget", "ratio", "network length", "catchment area", "project cost", "expenditure", "investment", "crores"]
-    if any(term in parameter for term in banned_terms):
+
+    if "pressure gauge" in text or "pressure gauge" in context:
         return True
-    if any(term in context for term in ["wto", "seventh plan", "cost effectiveness", "crores"]):
+
+    if len(text) < 5:
         return True
+
     return False
 
 
-def normalize_dpr_item(raw_item: dict, source_document: str, page: int, context: str, domain: str) -> dict | None:
-    raw_parameter = str(raw_item.get("parameter", "")).strip()
-    raw_entity = str(raw_item.get("entity", "")).strip()
-    raw_attribute = str(raw_item.get("attribute", "")).strip()
-    raw_value = str(raw_item.get("value", "")).strip()
-    try:
-        confidence = float(raw_item.get("confidence", 0.70) or 0.70)
-    except Exception:
-        confidence = 0.70
-    if not raw_parameter or not raw_value:
+def normalize_dpr_item(raw_item: dict, source_document: str, page: int, context: str, domain: str, seq: int) -> dict | None:
+    raw_parameter = clean_sentence(raw_item.get("parameter", ""))
+    raw_entity = clean_sentence(raw_item.get("entity", ""))
+    raw_value = clean_sentence(raw_item.get("value", ""))
+    raw_unit = clean_sentence(raw_item.get("unit", ""))
+    raw_fact_text = clean_sentence(raw_item.get("fact_text", ""))
+
+    if not raw_parameter and not raw_fact_text:
         return None
-    _, _, normalized_value, normalized_unit = normalize_numeric_value_and_unit(raw_value, explicit_unit=str(raw_item.get("unit", "")).strip())
-    if normalized_value in ("", None):
-        return None
-    mapped = map_to_ontology(raw_parameter, raw_entity, domain=domain, context=context)
-    parameter = str(mapped.get("parameter_canonical", "") or raw_parameter.strip().lower()).strip().lower()
-    entity = str(mapped.get("entity_canonical", "") or (raw_entity.strip().lower() if raw_entity.strip() else "unknown")).strip().lower()
-    if not parameter:
-        return None
-    return {
-        "source_document": source_document,
-        "page": page,
+
+    parameter = normalize_parameter(raw_parameter, source_document, context)
+    entity = normalize_entity(raw_entity, parameter, context)
+    domain = infer_domain_from_parameter(parameter, domain)
+
+    value_raw, unit_raw, value, unit = normalize_numeric_value_and_unit(raw_value, explicit_unit=raw_unit)
+
+    lo, hi, range_unit = extract_range(raw_value)
+    value_min = None
+    value_max = None
+
+    if lo is not None and hi is not None:
+        _, _, value_min, unit_min = normalize_numeric_value_and_unit(lo, explicit_unit=range_unit)
+        _, _, value_max, unit_max = normalize_numeric_value_and_unit(hi, explicit_unit=range_unit)
+        unit = unit_min or unit_max or unit
+
+    document_name = source_document
+    fact_text = raw_fact_text or clean_sentence(context, max_len=350)
+
+    fact_id = make_readable_fact_id(document_name, parameter, page, seq)
+    internal_id = stable_id(document_name, page, parameter, entity, value, value_min, value_max, fact_text, prefix="fact")
+
+    display_value = ""
+    if value_min is not None and value_max is not None:
+        display_value = f"{value_min} to {value_max} {unit}".strip()
+    elif value is not None and value != "":
+        display_value = f"{value} {unit}".strip()
+    elif raw_value:
+        display_value = raw_value
+
+    item = {
+        "id": internal_id,
+        "fact_id": fact_id,
+        "node_name": f"{fact_id} | {parameter} | {display_value}".strip(" |"),
+        "display_name": f"{fact_id} | {parameter} | {display_value}".strip(" |"),
+        "document_name": document_name,
+        "source_document": document_name,
         "domain": domain,
+        "page": page,
+        "page_label": f"p.{page}",
         "parameter": parameter,
-        "entity": entity if entity else "unknown",
-        "value": normalized_value,
-        "unit": normalized_unit,
-        "attribute": raw_attribute,
-        "context_snippet": context[:250].strip(),
-        "parameter_raw": raw_parameter,
-        "entity_raw": raw_entity,
-        "mapping_confidence": float(mapped.get("mapping_confidence", 0.60) or 0.60),
-        "confidence": confidence,
+        "entity": entity,
+        "value": value,
+        "value_min": value_min,
+        "value_max": value_max,
+        "unit": unit,
+        "display_value": display_value,
+        "fact_text": fact_text,
+        "comparison_sentence": fact_text,
+        "context_snippet": clean_sentence(context, max_len=500),
+        "confidence": float(raw_item.get("confidence", 0.70) or 0.70),
     }
+
+    if is_bad_dpr_candidate(item):
+        return None
+
+    return item
 
 
 def extract_dpr(pdf_path: str, domain: str = "generic", pages: list[dict] | None = None) -> list[dict]:
     print(f"\n📄 Reading DPR: {pdf_path}")
+
     if pages is None:
         pages = read_pdf_pages(pdf_path)
-    source_document = os.path.basename(pdf_path).replace(".pdf", "").strip().lower()
+
+    source_document = safe_slug(os.path.basename(pdf_path).replace(".pdf", ""))
     all_items = []
     page_count = 0
+    seq = 1
+
     for page_data in pages:
         page_no = page_data["page"]
-        page_text = page_data["text"]
+        page_text = clean_text(page_data["text"])
+
         if DEBUG_MAX_DPR_PAGES > 0 and page_count >= DEBUG_MAX_DPR_PAGES:
             break
+
         if not page_text:
             continue
+
         if should_skip_page(page_text):
-            print(f"⏭️  Skipping page {page_no} (low-value content)")
             continue
+
+        low = page_text.lower()
+        if "table of contents" in low or "list of tables" in low or "list of figures" in low:
+            continue
+
+        useful_signals = [
+            "1435",
+            "standard gauge",
+            "25 kv",
+            "50 hz",
+            "cbtc",
+            "moving block",
+            "headway",
+            "ato",
+            "atp",
+            "rigid ohe",
+            "flexible overhead",
+            "overhead equipment",
+        ]
+
+        if not any(s in low for s in useful_signals):
+            continue
+
         page_count += 1
         chunks = chunk_paragraphs(page_text, max_chars=2200, overlap_paragraphs=0)
+
         for chunk_idx, chunk in enumerate(chunks, start=1):
+            chunk_low = chunk.lower()
+            if not any(s in chunk_low for s in useful_signals):
+                continue
+
             print(f"⚙️  DPR page {page_no} | chunk {chunk_idx}/{len(chunks)}", end="\r")
+
             prompt = f"""
-Extract ONLY design/engineering facts from this DPR that can be checked against a technical rulebook.
+Extract only DPR engineering facts that can be validated against standards.
 
 Return ONLY valid JSON array.
-If no validatable engineering/design fact exists, return [].
+
+Reject:
+- table of contents
+- list of tables
+- list of figures
+- cost, finance, parking, humidity, weather, maintenance schedule
+- anything that is not an engineering design fact
 
 Schema:
 [
   {{
     "parameter": "",
     "entity": "",
-    "attribute": "",
     "value": "",
     "unit": "",
+    "fact_text": "",
     "confidence": 0.7
   }}
 ]
 
-Extract examples like design discharge, channel depth, channel width, bridge clearance, berth length, scour depth, gate size, pier width, embankment length, pond level, water level, vertical clearance, design draft, fairway width, barrage length.
-Do NOT extract economics, background narrative, costs, budgets, crores, ratios, page numbers, section titles.
+Valid facts include:
+- track gauge
+- traction voltage / frequency
+- OHE type
+- CBTC signalling
+- moving block
+- headway
+- ATO / ATP
+
+The fact_text must be the clean sentence where the value is mentioned.
 
 TEXT:
 {chunk}
 """
+
             response = call_llm(prompt, model_name=EXTRACTION_MODEL_NAME)
             parsed = safe_json_parse(response)
-            print(f"\n   [DEBUG] raw parsed dpr fact count page {page_no}: {len(parsed)}")
+
             for raw_item in parsed:
                 if not isinstance(raw_item, dict):
                     continue
-                raw_item.setdefault("confidence", 0.70)
-                item = normalize_dpr_item(raw_item=raw_item, source_document=source_document, page=page_no, context=chunk, domain=domain)
-                if not item:
-                    print("   [DEBUG] dropped: normalize_dpr_item -> None")
-                    continue
-                if not item["parameter"]:
-                    print(f"   [DEBUG] dropped empty parameter: {item.get('parameter_raw', '')}")
-                    continue
-                if item["mapping_confidence"] < 0.20:
-                    print(f"   [DEBUG] dropped low mapping confidence: {item['mapping_confidence']}")
-                    continue
-                if item["confidence"] < 0.30:
-                    print(f"   [DEBUG] dropped low extraction confidence: {item['confidence']}")
-                    continue
-                if is_bad_dpr_candidate(item):
-                    print(f"   [DEBUG] dropped bad dpr candidate: {item.get('parameter_raw', '')}")
-                    continue
-                all_items.append(item)
+
+                item = normalize_dpr_item(raw_item, source_document, page_no, chunk, domain, seq)
+
+                if item:
+                    all_items.append(item)
+                    seq += 1
+
     print()
+
     seen = set()
-    deduped = []
+    result = []
+
     for item in all_items:
-        key = (item["domain"], item["parameter"], item["entity"], str(item["value"]), item["unit"], item["attribute"])
+        key = (
+            item["parameter"],
+            item["entity"],
+            str(item.get("value")),
+            str(item.get("value_min")),
+            str(item.get("value_max")),
+            item.get("unit"),
+            item.get("fact_text"),
+        )
+
         if key in seen:
             continue
+
         seen.add(key)
-        deduped.append(item)
-    print(f"✅ Final DPR facts extracted: {len(deduped)}")
-    return deduped
+        result.append(item)
+
+    print(f"✅ Final clean DPR facts extracted: {len(result)}")
+    return result

@@ -1,106 +1,72 @@
-from llm.ollama_client import call_llm
-from utils.json_utils import safe_single_json
-from config import MAPPER_MODEL_NAME
+from utils.value_utils import normalize_text
 
 
-def _fallback_parameter(raw_parameter: str) -> str:
-    rp = (raw_parameter or "").strip().lower()
-    if not rp:
-        return "unknown"
-    replacements = {
-        "lacey’s scour depth": "scour depth",
-        "lacey's scour depth": "scour depth",
-        "present pond level": "pond level",
-        "future pond level": "pond level",
-        "piers width": "pier width",
-        "length of barrage": "barrage length",
-        "design discharge": "design discharge",
-        "intensity of discharge": "discharge intensity",
-        "water depth": "depth",
-        "basic width": "width",
-        "extra width in curves": "width",
-    }
-    return replacements.get(rp, rp)
+def normalize_parameter(parameter: str, source_document: str = "", context: str = "") -> str:
+    text = normalize_text(f"{parameter} {context}")
+    source = normalize_text(source_document)
+
+    if any(k in text for k in ["25 kv", "25kv", "traction voltage", "supply voltage", "nominal voltage", "voltage range"]):
+        return "traction_voltage"
+
+    if any(k in text for k in ["frequency", "50 hz", "50hz"]):
+        return "traction_frequency"
+
+    if any(k in text for k in ["rigid ohe", "flexible ohe", "overhead equipment", "overhead contact line", "catenary"]):
+        return "ohe_system"
+
+    if any(k in text for k in ["standard gauge", "track gauge", "rail gauge", "gauge"]):
+        if "pressure gauge" not in text:
+            return "track_gauge"
+
+    if any(k in text for k in ["cbtc", "communication based train control", "communications based train control", "moving block"]):
+        return "cbtc_signalling"
+
+    if any(k in text for k in ["headway", "90 second", "90 s", "90s"]):
+        return "headway"
+
+    if any(k in text for k in ["ato", "automatic train operation"]):
+        return "ato"
+
+    if any(k in text for k in ["atp", "automatic train protection"]):
+        return "atp"
+
+    if source:
+        if "60850" in source and "voltage" in text:
+            return "traction_voltage"
+        if "60913" in source and "overhead" in text:
+            return "ohe_system"
+
+    return normalize_text(parameter).replace(" ", "_") or "unknown_parameter"
 
 
-def _fallback_entity(raw_entity: str) -> str:
-    re_ = (raw_entity or "").strip().lower()
-    return re_ if re_ else "unknown"
+def normalize_entity(entity: str, parameter: str = "", context: str = "") -> str:
+    text = normalize_text(f"{entity} {parameter} {context}")
+
+    if "traction" in text or "voltage" in text or "ohe" in text or "overhead" in text:
+        return "traction_power_system"
+
+    if "gauge" in text or "track" in text or "rail" in text:
+        return "track"
+
+    if "cbtc" in text or "signalling" in text or "signaling" in text or "headway" in text:
+        return "signalling_system"
+
+    if "train" in text:
+        return "train_operation"
+
+    return normalize_text(entity).replace(" ", "_") or "unknown_entity"
 
 
-def map_to_ontology(raw_parameter: str, raw_entity: str, domain: str = "generic", context: str = ""):
-    prompt = f"""
-You are normalizing engineering concepts extracted from technical documents.
+def infer_domain_from_parameter(parameter: str, current_domain: str = "generic") -> str:
+    p = normalize_text(parameter)
 
-Return ONLY valid JSON object.
+    if p in {"traction_voltage", "traction_frequency", "ohe_system"}:
+        return "power"
 
-Schema:
-{{
-  "is_validatable": true,
-  "parameter_canonical": "",
-  "entity_canonical": "",
-  "parameter_family": "",
-  "entity_family": "",
-  "aliases": [],
-  "mapping_confidence": 0.0,
-  "reason": ""
-}}
+    if p in {"track_gauge"}:
+        return "track"
 
-Instructions:
-- Normalize the extracted rule/fact into a concise engineering concept.
-- If the concept is truly non-technical, policy/economic only, or not useful for engineering validation, set is_validatable=false.
-- Very common engineering parameters such as depth, width, clearance, discharge, radius, height, gauge, speed, draft, length, scour depth, pond level should usually remain validatable.
+    if p in {"cbtc_signalling", "headway", "ato", "atp"}:
+        return "signalling"
 
-Domain: {domain}
-Raw parameter: {raw_parameter}
-Raw entity: {raw_entity}
-Context: {context[:1200]}
-"""
-
-    response = call_llm(prompt, model_name=MAPPER_MODEL_NAME)
-    result = safe_single_json(response)
-    if not isinstance(result, dict):
-        result = {}
-
-    result.setdefault("is_validatable", True)
-    result.setdefault("parameter_canonical", "")
-    result.setdefault("entity_canonical", "")
-    result.setdefault("parameter_family", "unknown")
-    result.setdefault("entity_family", "unknown")
-    result.setdefault("aliases", [])
-    result.setdefault("mapping_confidence", 0.0)
-    result.setdefault("reason", "")
-
-    if not isinstance(result["aliases"], list):
-        result["aliases"] = []
-    try:
-        result["mapping_confidence"] = float(result["mapping_confidence"] or 0.0)
-    except Exception:
-        result["mapping_confidence"] = 0.0
-
-    param = str(result.get("parameter_canonical", "") or "").strip().lower()
-    entity = str(result.get("entity_canonical", "") or "").strip().lower()
-    if not param or param == "unknown":
-        param = _fallback_parameter(raw_parameter)
-    if not entity or entity == "":
-        entity = _fallback_entity(raw_entity)
-    if not param:
-        param = "unknown"
-    if not entity:
-        entity = "unknown"
-
-    result["parameter_canonical"] = param
-    result["entity_canonical"] = entity
-    if result["mapping_confidence"] <= 0:
-        result["mapping_confidence"] = 0.60 if param != "unknown" else 0.0
-
-    if param != "unknown" and result.get("is_validatable") is False:
-        lower_param = (raw_parameter or "").lower()
-        bad_terms = ["cost", "budget", "ratio", "expenditure", "investment", "crores", "network length", "statewise breakup", "wto", "seventh plan"]
-        if not any(t in lower_param for t in bad_terms):
-            result["is_validatable"] = True
-
-    result["parameter_family"] = str(result.get("parameter_family", "unknown") or "unknown").strip().lower()
-    result["entity_family"] = str(result.get("entity_family", "unknown") or "unknown").strip().lower()
-    result["reason"] = str(result.get("reason", "") or "").strip()
-    return result
+    return current_domain or "generic"

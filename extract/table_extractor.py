@@ -1,151 +1,188 @@
 import re
-import unicodedata
-from typing import Optional
-import pdfplumber
+from typing import List, Dict, Any
 
-_TABLE_SETTINGS = {
-    "vertical_strategy": "lines",
-    "horizontal_strategy": "lines",
-    "snap_tolerance": 5,
-    "join_tolerance": 3,
-    "edge_min_length": 10,
-    "min_words_vertical": 1,
-    "min_words_horizontal": 1,
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+
+HEADER_ALIASES = {
+    "parameter": {
+        "parameter", "design parameter", "item", "characteristic", "specification",
+        "system parameter", "criteria", "feature"
+    },
+    "entity": {
+        "entity", "system", "subsystem", "component", "application", "area"
+    },
+    "value": {
+        "value", "normative value", "requirement", "required value", "standard value",
+        "limit", "criteria value", "specified value"
+    },
+    "unit": {
+        "unit", "units"
+    },
+    "constraint_type": {
+        "constraint", "type", "operator", "comparison", "condition"
+    },
+    "requirement_text": {
+        "requirement text", "requirement", "rule", "provision", "description",
+        "remarks", "notes", "details", "specification details"
+    },
+    "reference": {
+        "reference", "clause", "standard", "code", "source"
+    },
 }
 
-_HEADER_ROLE_MAP = [
-    ("parameter", ["parameter", "param", "characteristic", "property", "description", "item", "criteria", "particulars", "specification"]),
-    ("entity", ["entity", "component", "element", "structure", "reach", "section", "location", "type", "class", "category"]),
-    ("value", ["value", "val", "magnitude", "quantity", "amount", "minimum", "maximum", "limit", "min", "max", "size"]),
-    ("unit", ["unit", "units", "uom", "u/m"]),
-    ("operator", ["constraint", "operator", "condition type", "op"]),
-    ("condition", ["condition", "remarks", "notes", "note", "when", "applicable", "clause", "reference"]),
-]
+
+def _normalize_header(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def _sanitize(cell) -> str:
+def _map_header(raw_header: str) -> str:
+    h = _normalize_header(raw_header)
+    for canonical, aliases in HEADER_ALIASES.items():
+        if h in aliases:
+            return canonical
+    return h
+
+
+def _looks_like_empty_row(row: list) -> bool:
+    if not row:
+        return True
+    values = [str(c or "").strip() for c in row]
+    return all(not v for v in values)
+
+
+def _clean_cell(cell: Any) -> str:
     if cell is None:
         return ""
-    text = str(cell)
-    text = unicodedata.normalize("NFKC", text)
-    for ch in ("\xad", "\u200b", "\u200c", "\u200d", "\ufeff"):
-        text = text.replace(ch, "")
-    text = re.sub(r"[\r\n]+", " ", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
+    text = str(cell).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def _classify_header_token(token: str) -> Optional[str]:
-    t = token.lower().strip()
-    for role, keywords in _HEADER_ROLE_MAP:
-        if any(kw in t for kw in keywords):
-            return role
-    return None
+def _guess_columns_from_header(header_row: list[str]) -> dict[int, str]:
+    mapping = {}
+    for idx, col in enumerate(header_row):
+        mapping[idx] = _map_header(col)
+    return mapping
 
 
-def _is_header_row(row: list[str]) -> bool:
-    non_empty = [c for c in row if c]
-    if not non_empty:
-        return False
-    label_count = sum(1 for c in non_empty if not re.search(r"\d", c) or len(c) < 6)
-    return label_count / len(non_empty) >= 0.6
+def _row_to_rule_dict(
+    row: list[str],
+    colmap: dict[int, str],
+    page_no: int,
+    default_reference: str = "",
+) -> dict | None:
+    item = {
+        "parameter": "",
+        "entity": "",
+        "value": "",
+        "unit": "",
+        "constraint_type": "",
+        "requirement_text": "",
+        "condition_text": "",
+        "reference": default_reference,
+        "confidence": 0.72,
+        "_page": page_no,
+    }
+
+    for idx, cell in enumerate(row):
+        key = colmap.get(idx, "")
+        value = _clean_cell(cell)
+        if not value:
+            continue
+
+        if key in item:
+            item[key] = value
+        else:
+            if item["requirement_text"]:
+                item["requirement_text"] += f" | {value}"
+            else:
+                item["requirement_text"] = value
+
+    if not item["parameter"] and item["requirement_text"]:
+        req = item["requirement_text"]
+        m = re.match(r"([A-Za-z][A-Za-z0-9 /\-\(\)]{2,50})[:\-]\s*(.+)", req)
+        if m:
+            item["parameter"] = m.group(1).strip()
+            if not item["value"]:
+                item["value"] = m.group(2).strip()
+
+    if not item["parameter"]:
+        return None
+
+    return item
 
 
-def _extract_operator_from_text(text: str) -> str:
-    t = text.lower()
-    if ">=" in t or "minimum" in t or "not less" in t or "at least" in t:
-        return ">="
-    if "<=" in t or "maximum" in t or "not more" in t or "at most" in t:
-        return "<="
-    if re.search(r"(?<![<>=])>(?![=])", t) or "greater than" in t:
-        return ">"
-    if re.search(r"(?<![<>=])<(?![=])", t) or "less than" in t:
-        return "<"
-    if "==" in t or "equal to" in t:
-        return "=="
-    return ">="
+def _extract_tables_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
+    if pdfplumber is None:
+        print("⚠️  pdfplumber not installed. Table extraction skipped.")
+        return []
 
+    extracted = []
 
-def _split_value_unit_cell(text: str):
-    text = text.strip()
-    op_hint = ""
-    m = re.match(r"^([<>]=?|==|≥|≤|>|<)\s*", text)
-    if m:
-        sym = m.group(1)
-        text = text[m.end():]
-        op_hint = {"≥": ">=", "≤": "<="}.get(sym, sym)
-    m2 = re.match(r"^(-?\d[\d,\.]*)\s*([a-zA-Z%/²³·\-\s]*)?$", text)
-    if m2:
-        raw_val = m2.group(1).replace(",", "")
-        raw_unit = (m2.group(2) or "").strip()
-        return op_hint, raw_val, raw_unit
-    return op_hint, text, ""
-
-
-def extract_tables_as_rules(pdf_path: str, domain: str = "generic") -> list[dict]:
-    import os
-    raw_rules = []
     with pdfplumber.open(pdf_path) as pdf:
-        total = len(pdf.pages)
-        for page_num, page in enumerate(pdf.pages, start=1):
-            print(f"📊 Table scan page {page_num}/{total}", end="\r")
+        for page_idx, page in enumerate(pdf.pages, start=1):
             try:
-                tables = page.extract_tables(_TABLE_SETTINGS)
-            except Exception as exc:
-                print(f"\n⚠️  Table extraction failed on page {page_num}: {exc}")
+                tables = page.extract_tables()
+            except Exception:
                 continue
+
             if not tables:
                 continue
+
             for table in tables:
                 if not table or len(table) < 2:
                     continue
-                clean_table = [[_sanitize(cell) for cell in row] for row in table]
-                header_idx = 0
-                for idx, row in enumerate(clean_table[:5]):
-                    if _is_header_row(row):
-                        header_idx = idx
-                        break
-                headers = clean_table[header_idx]
-                col_roles: dict[int, str] = {}
-                for col_i, h in enumerate(headers):
-                    role = _classify_header_token(h)
-                    if role:
-                        col_roles[col_i] = role
-                if "value" not in col_roles.values():
+
+                rows = [[_clean_cell(c) for c in row] for row in table if not _looks_like_empty_row(row)]
+                if len(rows) < 2:
                     continue
-                for row in clean_table[header_idx + 1:]:
-                    if not any(row):
-                        continue
-                    cells: dict[str, list[str]] = {}
-                    for col_i, role in col_roles.items():
-                        if col_i < len(row) and row[col_i]:
-                            cells.setdefault(role, []).append(row[col_i])
-                    parameter = " ".join(cells.get("parameter", [])).strip()
-                    entity = " ".join(cells.get("entity", [])).strip()
-                    condition = " ".join(cells.get("condition", [])).strip()
-                    raw_value_text = " ".join(cells.get("value", [])).strip()
-                    raw_unit_text = " ".join(cells.get("unit", [])).strip()
-                    raw_op_text = " ".join(cells.get("operator", [])).strip()
-                    if not parameter or not raw_value_text:
-                        continue
-                    op_hint, parsed_value, parsed_unit = _split_value_unit_cell(raw_value_text)
-                    final_unit = raw_unit_text or parsed_unit
-                    if raw_op_text:
-                        operator = _extract_operator_from_text(raw_op_text)
-                    elif op_hint:
-                        operator = op_hint
-                    else:
-                        operator = _extract_operator_from_text(parameter + " " + condition)
-                    raw_rules.append({
-                        "parameter": parameter,
-                        "entity": entity,
-                        "value": parsed_value,
-                        "unit": final_unit,
-                        "constraint_type": operator,
-                        "condition_text": condition,
-                        "confidence": 0.85,
-                        "source": "table",
-                        "_page": page_num,
-                    })
-    print()
-    return raw_rules
+
+                header = rows[0]
+                colmap = _guess_columns_from_header(header)
+
+                for row in rows[1:]:
+                    item = _row_to_rule_dict(row=row, colmap=colmap, page_no=page_idx)
+                    if item:
+                        extracted.append(item)
+
+    return extracted
+
+
+def _dedup_rules(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    result = []
+
+    for item in items:
+        key = (
+            item.get("_page"),
+            item.get("parameter", ""),
+            item.get("entity", ""),
+            item.get("value", ""),
+            item.get("unit", ""),
+            item.get("requirement_text", ""),
+            item.get("reference", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+
+    return result
+
+
+def extract_tables_as_rules(pdf_path: str, domain: str = "generic") -> List[Dict[str, Any]]:
+    try:
+        items = _extract_tables_pdfplumber(pdf_path)
+        items = _dedup_rules(items)
+        if items:
+            print(f"   📊 Table-derived raw rules: {len(items)}")
+        return items
+    except Exception as e:
+        print(f"⚠️  Table extraction failed for {pdf_path}: {e}")
+        return []

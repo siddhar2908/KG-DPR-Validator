@@ -1,130 +1,156 @@
-from collections import defaultdict
 from neo4j import GraphDatabase
-from config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-from validation.rule_matcher import is_rule_applicable
-from validation.sanitizer import is_valid_rule_for_parameter, is_valid_fact_for_parameter, entity_match_score
+from config import (
+    NEO4J_URI,
+    NEO4J_USER,
+    NEO4J_PASSWORD,
+    VALIDATION_MATCH_THRESHOLD,
+)
+from utils.value_utils import clean_sentence, normalize_unit, try_float
+from validation.rule_matcher import overall_match_score
+
 
 FLAGGED_STATUSES = {"non-compliant", "unit-mismatch", "no-rule"}
 
 
-def _evaluate(operator: str, rule_val, dpr_val) -> str:
-    try:
-        rv = float(rule_val)
-        dv = float(dpr_val)
-    except Exception:
-        return "non-compliant"
-    mapping = {">=": dv >= rv, "<=": dv <= rv, ">": dv > rv, "<": dv < rv, "==": dv == rv}
-    result = mapping.get(str(operator).strip())
-    if result is None:
-        return "non-compliant"
-    return "compliant" if result else "non-compliant"
-
-
-def _fetch_rules(session, domain: str) -> list[dict]:
+def _fetch_rules(session) -> list[dict]:
     query = """
-    MATCH (r:Rule)-[:ON_PARAMETER]->(p:CanonicalParameter)
-    MATCH (r)-[:ON_ENTITY]->(e:CanonicalEntity)
-    MATCH (r)-[:DEFINED_IN]->(d:Document)-[:IN_DOMAIN]->(dom:Domain)
-    WHERE dom.name = $domain
-    RETURN p.name AS parameter, e.name AS entity, r.operator AS operator,
-           r.value AS value, r.unit AS unit, r.page AS page,
-           r.context_snippet AS context_snippet, r.condition_text AS condition_text,
-           r.source_document AS source_document, r.domain AS domain
+    MATCH (doc:Document)-[:HAS_RULE]->(r:Rule)
+    RETURN
+      r.id AS id,
+      r.rule_id AS rule_id,
+      r.parameter AS parameter,
+      r.entity AS entity,
+      r.domain AS domain,
+      r.rule_type AS rule_type,
+      r.operator AS operator,
+      r.value AS value,
+      r.value_min AS value_min,
+      r.value_max AS value_max,
+      r.unit AS unit,
+      r.display_value AS display_value,
+      r.requirement_text AS requirement_text,
+      r.comparison_sentence AS comparison_sentence,
+      r.source_document AS source_document,
+      r.page AS page,
+      r.page_label AS page_label,
+      r.reference AS reference
     """
-    return [dict(r) for r in session.run(query, domain=domain)]
+    return [dict(r) for r in session.run(query)]
+
+
+def _units_match(rule_unit: str, fact_unit: str) -> bool:
+    ru = normalize_unit(rule_unit or "")
+    fu = normalize_unit(fact_unit or "")
+
+    if not ru or not fu:
+        return True
+
+    return ru == fu
+
+
+def _evaluate(rule: dict, fact: dict) -> tuple[str, str]:
+    rule_type = rule.get("rule_type", "semantic")
+
+    if not _units_match(rule.get("unit"), fact.get("unit")):
+        return "unit-mismatch", "Units are different."
+
+    fv = try_float(fact.get("value"))
+    rv = try_float(rule.get("value"))
+    rmin = try_float(rule.get("value_min"))
+    rmax = try_float(rule.get("value_max"))
+
+    if rule_type == "range" and rmin is not None and rmax is not None and fv is not None:
+        if rmin <= fv <= rmax:
+            return "compliant", "DPR value is within the permitted range."
+        return "non-compliant", "DPR value is outside the permitted range."
+
+    if rule_type in {"numeric", "exact"} and rv is not None and fv is not None:
+        op = rule.get("operator") or "=="
+
+        if op == ">=":
+            ok = fv >= rv
+        elif op == "<=":
+            ok = fv <= rv
+        elif op == ">":
+            ok = fv > rv
+        elif op == "<":
+            ok = fv < rv
+        else:
+            ok = fv == rv
+
+        return ("compliant", "DPR value satisfies the numeric rule.") if ok else (
+            "non-compliant",
+            "DPR value does not satisfy the numeric rule.",
+        )
+
+    return "compliant", "Semantic rule matched the DPR fact."
 
 
 def run_validation(dpr_facts: list[dict]) -> list[dict]:
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    domains = sorted({f.get("domain", "generic") for f in dpr_facts})
-    rules_by_domain = {}
+
     with driver.session() as session:
-        for domain in domains:
-            rules_by_domain[domain] = _fetch_rules(session, domain)
+        rules = _fetch_rules(session)
+
     driver.close()
 
-    clean_rules_by_domain = {}
-    for domain, rules in rules_by_domain.items():
-        clean_rules_by_domain[domain] = [r for r in rules if is_valid_rule_for_parameter(r["parameter"], r["unit"], r["value"])]
-
-    clean_facts = [f for f in dpr_facts if is_valid_fact_for_parameter(f["parameter"], f["unit"], f["value"])]
-
-    indexed_rules = {}
-    for domain, rules in clean_rules_by_domain.items():
-        bucket = defaultdict(list)
-        for r in rules:
-            bucket[r["parameter"]].append(r)
-        indexed_rules[domain] = bucket
-
     results = []
-    for fact in clean_facts:
-        parameter = fact["parameter"]
-        entity = fact["entity"]
-        domain = fact.get("domain", "generic")
-        fact_unit = fact.get("unit", "")
-        candidates = indexed_rules.get(domain, {}).get(parameter, [])
-        if not candidates:
-            results.append({
-                "parameter": parameter,
-                "entity": entity,
-                "domain": domain,
-                "source_document": fact["source_document"],
-                "dpr_page": fact["page"],
-                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
-                "status": "no-rule",
-                "flagged": True,
-                "reason": "No rule found for parameter in same domain",
-            })
-            continue
+
+    for fact in dpr_facts:
         scored = []
-        for rule in candidates:
-            score = entity_match_score(rule["entity"], entity)
-            if score == 0:
-                continue
-            if not is_rule_applicable(rule.get("condition_text", ""), fact.get("context_snippet", "")):
-                continue
-            unit_bonus = 1 if (rule.get("unit") or "").strip().lower() == (fact_unit or "").strip().lower() else 0
-            scored.append((score * 10 + unit_bonus, rule))
+
+        for rule in rules:
+            score = overall_match_score(rule, fact)
+            if score >= VALIDATION_MATCH_THRESHOLD:
+                scored.append((score, rule))
+
         if not scored:
             results.append({
-                "parameter": parameter,
-                "entity": entity,
-                "domain": domain,
-                "source_document": fact["source_document"],
-                "dpr_page": fact["page"],
-                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
+                "fact_internal_id": fact.get("id"),
+                "fact_id": fact.get("fact_id"),
+                "parameter": fact.get("parameter"),
+                "entity": fact.get("entity"),
                 "status": "no-rule",
                 "flagged": True,
-                "reason": "No applicable rule after entity/context filtering",
+                "reason": "No sufficiently similar rule found.",
+                "dpr_source": fact.get("source_document"),
+                "dpr_page": fact.get("page"),
+                "dpr_value": fact.get("display_value", ""),
+                "dpr_sentence": clean_sentence(fact.get("comparison_sentence") or fact.get("fact_text")),
+                "matched_rule_id": "",
+                "matched_rulebook": "",
+                "matched_rule_page": "",
+                "matched_rule_value": "",
+                "rule_sentence": "",
+                "match_score": 0.0,
             })
             continue
+
         scored.sort(key=lambda x: x[0], reverse=True)
-        best_rule = scored[0][1]
-        if (best_rule.get("unit") or "").strip() != (fact_unit or "").strip():
-            results.append({
-                "parameter": parameter,
-                "entity": entity,
-                "domain": domain,
-                "source_document": fact["source_document"],
-                "dpr_page": fact["page"],
-                "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
-                "status": "unit-mismatch",
-                "flagged": True,
-                "rule": f"{best_rule['operator']} {best_rule['value']} {best_rule['unit']}".strip(),
-                "rule_page": best_rule.get("page"),
-            })
-            continue
-        status = _evaluate(best_rule["operator"], best_rule["value"], fact["value"])
+        best_score, best_rule = scored[0]
+
+        status, reason = _evaluate(best_rule, fact)
+
         results.append({
-            "parameter": parameter,
-            "entity": entity,
-            "domain": domain,
-            "source_document": fact["source_document"],
-            "dpr_page": fact["page"],
-            "dpr_value": f"{fact['value']} {fact['unit']}".strip(),
+            "fact_internal_id": fact.get("id"),
+            "fact_id": fact.get("fact_id"),
+            "parameter": fact.get("parameter"),
+            "entity": fact.get("entity"),
             "status": status,
             "flagged": status in FLAGGED_STATUSES,
-            "rule": f"{best_rule['operator']} {best_rule['value']} {best_rule['unit']}".strip(),
-            "rule_page": best_rule.get("page"),
+            "reason": reason,
+            "dpr_source": fact.get("source_document"),
+            "dpr_page": fact.get("page"),
+            "dpr_value": fact.get("display_value", ""),
+            "dpr_sentence": clean_sentence(fact.get("comparison_sentence") or fact.get("fact_text")),
+            "matched_rule_internal_id": best_rule.get("id"),
+            "matched_rule_id": best_rule.get("rule_id"),
+            "matched_rulebook": best_rule.get("source_document"),
+            "matched_rule_page": best_rule.get("page"),
+            "matched_rule_value": best_rule.get("display_value", ""),
+            "rule_sentence": clean_sentence(best_rule.get("comparison_sentence") or best_rule.get("requirement_text")),
+            "rule_reference": best_rule.get("reference", ""),
+            "match_score": round(best_score, 4),
         })
+
     return results
