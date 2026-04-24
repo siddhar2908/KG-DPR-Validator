@@ -20,7 +20,6 @@ venv/
 # -------------------------
 # Intermediate pipeline outputs (IGNORE)
 # -------------------------
-data/intermediate/
 data/output/
 
 # -------------------------
